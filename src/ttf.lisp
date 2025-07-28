@@ -334,7 +334,299 @@
   ;; TODO: write a distributive transform for Mul-Sym
   )
 
-;;; 3.1
+;;; 3.1: un/typed lambda calculus in initial form
 (coalton-toplevel
+  ;; de brujin indices for arguments
+  (define-type Variable
+    VarZero
+    (VarSucc Variable))
+  ;; AST for (untyped) lambda calculus
+  (define-type DataTag
+    (VarTag Variable)
+    (BoolTag Boolean)
+    (LambdaTag DataTag)
+    (ApplyTag DataTag DataTag))
+  ;; term evaluation can give two things back, so obligated to build a union type with tags
+  (define-type UniverseTag
+    (UBool Boolean)
+    (UApp (UniverseTag -> UniverseTag)))
   
+  ;; lookup successor-encoded indices inside of a list
+  (define (lookp x env)
+    (match (Tuple x env)
+      ((Tuple (VarSucc z) (Cons _ y))
+       (lookp z y))
+      ;; nonexhaustive compiler warning
+      ((Tuple (VarZero) (Cons y _))
+       y)))
+  
+  ;; evaluation rules
+  (define (eval env term)
+    (match term
+      ((VarTag var)
+       (lookp var env))
+      ((BoolTag bool)
+       (UBool bool))
+      ((LambdaTag ell)
+       (UApp (fn (x) (eval (Cons x env) ell))))
+      ((ApplyTag f x)
+       ;; nonexhaustive compiler warning --- can't tell if eval'ing f will give something to which x can be applied
+       (match (eval env f)
+         ((UApp f-resolved)
+          (f-resolved (eval env x)))))))
+  
+  ;; toy term
+  (define ti1
+    (ApplyTag (LambdaTag (VarTag VarZero)) (BoolTag True)))
+  ;; DEMO: (eval Nil ti1)
+  
+  ;; example ill-typed terms from the perspective of eval but the initial encoding permits them anyway
+  (define ti2a
+    (ApplyTag (BoolTag True) (BoolTag False))) ; can't apply bool to bool
+  (define ti2o
+    (ApplyTag (LambdaTag (VarTag (VarSucc VarZero))) (BoolTag True))) ; oob variable
+  
+  ;; could build some (declare type-check (DataTag -> Result ErrMsg DataTag))
+  ;; but eval has no way of knowing whether type-check has been done, so needs tags
   )
+
+;;; 3.2: typed initial embedding via GADTs, which IIUC coalton doesn't have
+
+;;; 3.3: typed final embedding of integer lambda calculus
+(coalton-toplevel
+  (define (constant-at x) (fn (_) x))   ; utility
+  
+  ;; basic final embedding of integer lambda calculus via de brujin indices.
+  ;; :h is a "rest of environment" type. we'll use a Cons-list-like structure but made out of `Tuple's so that we can support nonuniform value types. (this makes explicit the total environment type at each stage of the computation.)
+  (define-class (SymanticsDB :repr)
+    (int (Integer -> :repr :h Integer))
+    (add (:repr :h Integer -> :repr :h Integer -> :repr :h Integer))
+    (z (:repr (Tuple :a :h) :a))        ; zeroth variable
+    (s (:repr :h :a -> :repr (Tuple :any :h) :a)) ; scroll to next variable when evaling inside of s
+    ;; if prepending :a to env and running the body yields :b, then lam yields :a -> :b in env.
+    (lam (:repr (Tuple :a :h) :b -> :repr :h (:a -> :b)))
+    ;; given a function yielding :b from env + :a and given an :a, get :b
+    (app (:repr :h (:a -> :b) -> :repr :h :a -> :repr :h :b)))
+  
+  ;; some sample terms and their types
+  (declare td1 (SymanticsDB :repr => :repr :h Integer))
+  (define td1
+    (add (int 1) (int 2)))              ; (+ 1 2)
+  (declare td2o (SymanticsDB :repr => :repr (Tuple Integer :h) (Integer -> Integer)))
+  (define td2o
+    (lam (add z (s z))))                ; (fn (x1) (+ x1 x0))
+  (declare td3 (SymanticsDB :repr => :repr :h ((Integer -> Integer) -> Integer)))
+  (define td3
+    (lam (add (app z (int 1)) (int 2)))) ; (fn (x0) (+ (x0 1) 2))
+  
+  ;; evaluation interpreter.
+  ;; R is not actually a type tag, just an interpreter tag. because unR is total (even branch-less!), it can be compiled out.
+  ;; (:h -> :a) lets us evaluate the environment to form a term.
+  ;; we model the environment as nested `Tuple's, so that we can keep values of nonuniform type.
+  (define-type (RTypeDB :h :a)
+    (RDB (:h -> :a)))
+  (define (unRDB (RDB val)) val)
+  (define-instance (SymanticsDB RTypeDB)
+    (define (int x)
+      (RDB (constant-at x))) ; constants don't depend on the environment
+    (define (add e1 e2)
+      (RDB (fn (env) (+ (unRDB e1 env) (unRDB e2 env))))) ; addition acts on immediates
+    (define z
+      (RDB (fn ((Tuple x _)) x)))    ; look up zeroth var in environment
+    (define (s v)
+      (RDB (fn ((Tuple _ h)) (unRDB v h)))) ; drop head of environment while evaling v
+    (define (lam e)
+      (RDB (fn (env x) (unRDB e (Tuple x env))))) ; absorb delayed value x into env, then eval e
+    (define (app e1 e2)
+      (RDB (fn (env) ((unRDB e1 env) (unRDB e2 env))))))
+  (define (eval e)
+    (unRDB e Nil))          ; any garbage environment value here is fine, pick a non-language term to guarantee type error on invalid access
+  ;; DEMO: (eval td1)         ;; => 3
+  ;; DEMO: ((eval td3) (+ 2)) ;; => 5 ; note that this mixes embedded language and host language!
+  
+  ;; printer interpreter. nothing too exciting beyond string munging.
+  (define-type (PTypeDB :h :a)
+    (PDB (Integer -> String))) ; the Integer "environment" this time is the innermost de brujin label
+  (define (unPDB (PDB val)) val)
+  (define-instance (SymanticsDB PTypeDB)
+    (define (int x)
+      (PDB (constant-at (into x))))
+    (define (add e1 e2)
+      (PDB (fn (h)
+           (fold str:concat "" (make-list "(" (unPDB e1 h) " + " (unPDB e2 h) ")")))))
+    (define z
+      (PDB (fn (h) (str:concat "x" (into (- h 1))))))
+    (define (s v)
+      (PDB (fn (h) (unPDB v (- h 1)))))
+    (define (lam e)
+      (PDB (fn (h)
+           (let ((x (str:concat "x" (into h))))
+             (fold str:concat "" (make-list "(\\" x " -> " (unPDB e (+ 1 h)) ")"))))))
+    (define (app e1 e2)
+      (PDB (fn (h)
+           (fold str:concat "" (make-list "(" (unPDB e1 h) " " (unPDB e2 h) ")"))))))
+  (define (view e)
+    (unPDB e 0))
+  ;; DEMO: (view td1)  ;; => "(1 + 2)"
+  ;; DEMO: (view td2o) ;; => "(\x0 -> (x0 + x-1))" ; can print open terms just fine!
+  ;; DEMO: (view td3)  ;; => "(\x0 -> ((x0 1) + 2))"
+  )
+
+;;; 3.4: Tagless final embedding with higher-order abstract syntax
+(coalton-toplevel
+  (define (constant-at x) (fn (_) x))   ; utility
+  
+  ;; same language, but use host language for variable bindings
+  (define-class (Symantics :repr)
+    (int (Integer -> :repr Integer))
+    (add (:repr Integer -> :repr Integer -> :repr Integer))
+    (lam ((:repr :a -> :repr :b) -> :repr (:a -> :b)))
+    (app (:repr (:a -> :b) -> :repr :a -> :repr :b)))
+  
+  ;; some sample terms to show what we mean
+  (declare th1 (Symantics :repr => :repr Integer))
+  (define th1 (add (int 1) (int 2)))
+  (declare th2 (Symantics :repr => :repr (Integer -> Integer)))
+  (define th2 (lam (fn (x) (add x x)))) ; fn is the coalton fn!
+  (declare th3 (Symantics :repr => :repr ((Integer -> Integer) -> Integer)))
+  (define th3 (lam (fn (x) (add (app x (int 1)) (int 2)))))
+  
+  ;; evaluation interpreter
+  (define-type (RType :a)
+    (R :a))
+  (define (unR (R val)) val)
+  (define-instance (Symantics RType)
+    (define (int x)
+      (R x))
+    (define (add e1 e2)
+      (R (+ (unR e1) (unR e2))))
+    (define (lam f)
+      (R (fn (x) (unR (f (R x))))))
+    (define (app e1 e2)
+      (R ((unR e1) (unR e2)))))
+  (define (eval e) (unR e))
+  ;; DEMO: (eval th1)         ;; => 3
+  ;; DEMO: ((eval th2) 4)     ;; => 8
+  ;; DEMO: ((eval th3) (+ 2)) ;; => 5
+  
+  ;; printer interpreter
+  (define-type-alias VarCounter Integer)
+  (define-type (PType :a)
+    (P (VarCounter -> String)))
+  (define (unP (P val)) val)
+  (define-instance (Symantics PType)
+    (define (int x)
+      (P (constant-at (into x))))
+    (define (add e1 e2)
+      (P (fn (h)
+           (fold str:concat "" (make-list "(" (unP e1 h) " + " (unP e2 h) ")")))))
+    ;; note that we can print lambda terms just fine, even though their contents has been directly encoded into coalton via fn!
+    ;; the only thing we've lost is the variable name, for which we substitute a de brujin index instead.
+    (define (lam f)
+      (P (fn (h)
+           (let ((x (str:concat "x" (into h))))
+             (fold str:concat "" (make-list "(\\" x " -> " (unP (f (P (constant-at x))) (+ 1 h)) ")"))))))
+    (define (app e1 e2)
+      (P (fn (h)
+           (fold str:concat "" (make-list "(" (unP e1 h) " " (unP e2 h) ")"))))))
+  (define (view e) (unP e 0))
+  ;; DEMO: (view th1) ;; => "(1 + 2)"
+  ;; DEMO: (view th2) ;; => "(\x0 -> x0 + x0)"
+  ;; DEMO: (view th3) ;; => "(\x0 -> ((x0 1) + 2))"
+  
+  ;; extending by multiplication, booleans, fixed point function, all as independent language extensions.
+  (define-class (MulSym :repr)
+    (mul (:repr Integer -> :repr Integer -> :repr Integer)))
+  
+  (define-class (BoolSym :repr)
+    (bool (Boolean -> :repr Boolean))
+    (leq (:repr Integer -> :repr Integer -> :repr Boolean))
+    ;; one trade of the final form is that we're beholden to the evaluation model of the host language.
+    ;; coalton evaluates function arguments eagerly, so we have to do the trick where its branches are frozen as lambdas and released conditionally.
+    ;; we don't have 0-ary lambdas, so i have them consuming dummy integers for now 🤷‍♀️
+    (if_ (:repr Boolean -> :repr (Integer -> :a) -> :repr (Integer -> :a) -> :repr :a)))
+  
+  (define-class (FixSym :repr)
+    (fix_ ((:repr (:a -> :b) -> :repr (:a -> :b)) -> :repr (:a -> :b))))
+  
+  ;; some demo terms using these extensions.
+  ;; 2-ary power function
+  (declare tpow ((Symantics :repr) (MulSym :repr) (BoolSym :repr) (FixSym :repr) =>
+                 :repr (Integer -> Integer -> Integer)))
+  (define tpow
+    (lam (fn (x)
+           (fix_ (fn (self)
+                   (lam (fn (n)
+                          (if_ (leq n (int 0))
+                               (lam (fn (_) (int 1)))
+                               (lam (fn (_) (mul x (app self (add n (int -1))))))))))))))
+
+  ;; 1-ary seventh power function
+  (declare tpow7 ((Symantics :repr) (MulSym :repr) (BoolSym :repr) (FixSym :repr) =>
+                  :repr (Integer -> Integer)))
+  (define tpow7
+    (lam (fn (x) (app (app tpow x) (int 7)))))
+  ;; 2^7 as a closed but unevaluated term
+  (declare tpow72 ((Symantics :repr) (MulSym :repr) (BoolSym :repr) (FixSym :repr) =>
+                   :repr Integer))
+  (define tpow72
+    (app tpow7 (int 2)))
+  ;; factorial function
+  (declare fact ((Symantics :repr) (MulSym :repr) (BoolSym :repr) (FixSym :repr) =>
+                 :repr (Integer -> Integer)))
+  (define fact
+    (fix_ (fn (self) (lam (fn (n) 
+                            (if_ (leq n (int 0))
+                                 (lam (fn (_) (int 1)))
+                                 (lam (fn (_) (mul n (app self (add n (int -1))))))))))))
+   
+  ;; extending the evaluation interpreter over the language extensions
+  (define-instance (MulSym RType)
+    (define (mul e1 e2)
+      (R (* (unR e1) (unR e2)))))
+   
+  (define-instance (BoolSym RType)
+    (define (bool val)
+      (R val))
+    (define (leq e1 e2)
+      (R (<= (unR e1) (unR e2))))
+    (define (if_ bt et ef)
+      (R (if (unR bt) ((unR et) 0) ((unR ef) 0)))))
+  
+  (define-instance (FixSym RType)
+    (define (fix_ f)
+      (R (fix (fn (self) (unR (f (R self))))))))
+  
+  ;; extending the printing interpreter over the language extensions
+  (define-instance (MulSym PType)
+    (define (mul e1 e2)
+      (P (fn (h)
+           (fold str:concat "" (make-list "(* " (unP e1 h) " " (unP e2 h) ")"))))))
+  
+  (define-instance (BoolSym PType)
+    (define (bool val)
+      (P (fn (h) (match val
+                   ((True) "(bool True)")
+                   ((False) "(bool False)")))))
+    (define (leq e1 e2)
+      (P (fn (h)
+           (fold str:concat "" (make-list "(leq " (unP e1 h) " " (unP e2 h) ")")))))
+    (define (if_ bt et ef)
+      (P (fn (h)
+           (fold str:concat "" (make-list "(if " (unP bt h) " " (unP et h) " " (unP ef h) ")"))))))
+  
+  (define-instance (FixSym PType)
+    (define (fix_ f)
+      (P (fn (h)
+           (let ((self (str:concat "self" (into h))))
+             (fold str:concat "" (make-list "(fix " self " . " (unP (f (P (const self))) (+ 1 h)) ")")))))))
+  
+  ;; DEMO: (view tpow72) ;; => "((\\x0 -> (((\\x1 -> (fix self2 . (\\x3 -> (if (leq x3 0) (\\x4 -> 1) (\\x4 -> (* x1 (self2 (x3 + -1)))))))) x0) 7)) 2)"
+  ;; in particular this makes clear we haven't evaluated anything in assembling the term, we can see the whole pre-evaluation structure.
+  ;; DEMO: (eval tpow72) ;; => 128 ; 😎
+  ;; DEMO: (eval (app fact (int 15))) ;; => 1307674368000
+  )
+
+;;; 3.5: explores relationship between 3.4 and the GADT embedding, which again we have to skip
+
+;;; 4: "real fun" -- there are a lot of little projects here, and comparatively little code. i'll probably stop here.
